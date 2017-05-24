@@ -2,6 +2,7 @@
 # © 2015 David BEAL @ Akretion
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html).
 
+import logging
 from openerp import models, fields, api, _
 from openerp.osv import orm
 from openerp.exceptions import Warning as UserError
@@ -14,6 +15,8 @@ PROFILE_MENU = (_("Sales > Configuration \n> Product Categories and Attributes"
 # not an immutable value according to profile
 PROF_DEFAULT_STR = 'profile_default_'
 LEN_DEF_STR = len(PROF_DEFAULT_STR)
+
+_logger = logging.getLogger(__name__)
 
 
 def format_except_message(error, field, self):
@@ -72,21 +75,44 @@ class ProductProfile(models.Model):
     def write(self, vals):
         """ Profile update can impact products: we take care
             to propagate ad hoc changes """
-        res = super(ProductProfile, self).write(vals)
-        keys2remove = []
+        new_vals = vals.copy()
+        excludable_fields = get_profile_fields_to_exclude()
         for key in vals:
-            if (key[:LEN_DEF_STR] == PROF_DEFAULT_STR or
-                    key in get_profile_fields_to_exclude()):
-                keys2remove.append(key)
-        for key in keys2remove:
-            # we remove keys which have no matching in product template
-            vals.pop(key)
-        if vals:
-            products = self.env['product.product'].search(
-                [('profile_id', '=', self.id)])
-            if products:
-                products.write({'profile_id': self.id})
+            if (key.startswith(PROF_DEFAULT_STR) or
+                    key in excludable_fields or
+                    self.check_useless_key_in_vals(new_vals, key)):
+                new_vals.pop(key)
+        # super call must be after check_useless_key_in_vals() call
+        # because we compare value before and after write
+        res = super(ProductProfile, self).write(new_vals)
+        if new_vals:
+            for rec in self:
+                products = self.env['product.product'].search(
+                    [('profile_id', '=', rec.id)])
+                if products:
+                    _logger.info(
+                        " >>> %s Products updating after updated '%s' "
+                        "product profile" % (len(products), rec.name))
+                    products.write({'profile_id': rec.id})
         return res
+
+    @api.model
+    def check_useless_key_in_vals(self, vals, key):
+        """ If replacing values are the same than in db, we remove them.
+            Use cases:
+            1/ if in edition mode you switch a field
+               from value A to value B and then go back to value A
+               then save form, field is in vals whereas it shouldn't.
+            2/ if profile data are in csv file there are processed
+               each time module containing csv is loaded
+            we remove field from vals to minimize impact on products
+        """
+        comparison_value = self[key]
+        if self._fields[key].type == 'many2one':
+            comparison_value = self[key].id
+        elif self._fields[key].type == 'many2many':
+            comparison_value = [(6, False, self[key].ids), ]
+        return vals[key] == comparison_value
 
     @api.model
     def fields_view_get(self, view_id=None, view_type='form',
@@ -117,13 +143,13 @@ class ProductMixinProfile(models.AbstractModel):
                 if field not in fields_to_exclude]
 
     @api.model
-    def _get_profile_data(self, profile_id, filled_fields=None):
+    def _get_profile_data(self, values, filled_fields=None):
         # Note for migration to v9
         # - rename method to a more convenient name _get_vals_from_profile()
         # - remove unused filled_fields args
         profile_obj = self.env['product.profile']
         fields = self._get_profile_fields()
-        vals = profile_obj.browse(profile_id).read(fields)[0]
+        vals = profile_obj.browse(values['profile_id']).read(fields)[0]
         vals.pop('id')
         for field, value in vals.items():
             if value and profile_obj._fields[field].type == 'many2one':
@@ -132,7 +158,10 @@ class ProductMixinProfile(models.AbstractModel):
             if profile_obj._fields[field].type == 'many2many':
                 vals[field] = [(6, 0, value)]
             if PROF_DEFAULT_STR == field[:LEN_DEF_STR]:
-                vals[field[LEN_DEF_STR:]] = vals[field]
+                if field[LEN_DEF_STR:] not in values:
+                    # we only put the default profile value
+                    # if their is no matching in default data
+                    vals[field[LEN_DEF_STR:]] = vals[field]
                 # prefixed fields must be removed from dict
                 # because they are in profile not in product
                 vals.pop(field)
@@ -143,7 +172,7 @@ class ProductMixinProfile(models.AbstractModel):
         """ Update product fields with product.profile corresponding fields """
         self.ensure_one()
         if self.profile_id:
-            values = self._get_profile_data(self.profile_id.id)
+            values = self._get_profile_data({'profile_id': self.profile_id.id})
             for field, value in values.items():
                 try:
                     self[field] = value
@@ -153,13 +182,13 @@ class ProductMixinProfile(models.AbstractModel):
     @api.model
     def create(self, vals):
         if vals.get('profile_id'):
-            vals.update(self._get_profile_data(vals['profile_id']))
+            vals.update(self._get_profile_data(vals))
         return super(ProductMixinProfile, self).create(vals)
 
     @api.multi
     def write(self, vals):
         if vals.get('profile_id'):
-            vals.update(self._get_profile_data(vals['profile_id']))
+            vals.update(self._get_profile_data(vals))
         return super(ProductMixinProfile, self).write(vals)
 
     @api.model
