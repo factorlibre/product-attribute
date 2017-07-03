@@ -46,6 +46,7 @@ msgstr "Altura"
 #. module: product_dimension
 #: field:product.product,length:0
 msgid "Length"
+msgstr "Longitud"
 
 #. module: product_dimension
 #: model:ir.model,name:product_dimension.model_product_product
